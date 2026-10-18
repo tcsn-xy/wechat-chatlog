@@ -1,0 +1,3 @@
+# Dedicated .venv-asr; do not replace the chat-sync environment.
+mlx-audio==0.5.9
+pymysql==1.2.3

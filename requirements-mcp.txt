@@ -1,0 +1,2 @@
+# Optional local MCP adapter; the plain CLI does not import this dependency.
+mcp==2.3.0
