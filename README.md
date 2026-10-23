@@ -3,7 +3,7 @@
 macOS 上读取**本人设备、本人账号**的微信 4.x / 企业微信 5.x 本机数据，提供两个核心能力：
 
 1. **聊天记录导出**：抓取本机快照与密钥，导出 HTML / TXT / CSV，带图片、语音、视频、文件和表情；可导入本机 MySQL，支持每小时全来源核验与准实时文字同步。
-2. **chatlog 只读查询**：把已入库记录交给 `chatlog` CLI 或本机 stdio MCP，供人和 AI 检索正文、原文、链接、语音转写与已有图片描述；不发送消息、不同步、不导出 BLOB。
+2. **chatlog 只读查询**：把已入库记录交给 `chatlog` CLI 或本机 stdio MCP，供人和 AI 检索正文、原文、链接、语音转写、已有图片描述，并可按需查看本机图片的 JPEG 预览；不发送消息、不同步、不导出数据库 BLOB。
 
 > 本项目不是腾讯官方 SDK。只应用于本人账号在本人设备上的数据；请遵守当地法律与客户端服务条款，不要用它导出或传播他人的聊天记录。
 >
@@ -17,7 +17,7 @@ macOS 上读取**本人设备、本人账号**的微信 4.x / 企业微信 5.x �
 - 每小时全来源核验 + 准实时文字同步 + 独立媒体采集；后台任务由 `launchd` 管理。
 - 可选图片描述/OCR（MiniMax Coding Plan，默认关闭，必须显式授权图片外发）。
 - 可选本地语音转写（Qwen3-ASR，独立 `.venv-asr`，离线运行，只处理冻结批次）。
-- 可选只读 `chatlog` CLI 与 MCP（9 个只读工具，不暴露任意 SQL、shell 或路径读取）。
+- 可选只读 `chatlog` CLI 与 MCP（10 个只读工具，不暴露任意 SQL、shell 或路径读取；MCP 回传图片需用户显式授权）。
 
 没有缓存的媒体不能凭空恢复；客户端版本、TCC 权限、重新登录和副本签名都会影响可用性。**不保证所有版本通用，也不对外宣称“全部导出了”**。
 
@@ -91,6 +91,7 @@ chatlog capabilities --json
 chatlog chats "群名或联系人" --json
 chatlog search "关键词" --platform wecom --scope text --json
 chatlog messages --chat wechat:chat:123 --since 2026-10-01 --json
+chatlog media wechat:message:123 --json    # 看该消息的本机图片预览
 ```
 
 只读 MCP（可选，需要 `requirements-mcp.txt`）：
@@ -100,7 +101,7 @@ chatlog messages --chat wechat:chat:123 --since 2026-10-01 --json
 ./.venv/bin/python scripts/install_chatlog_mcp.py
 ```
 
-安装器只授予查询所需表的 `SELECT`；配置写入 `~/.config/chatlog/config.json`（0600），不保存到客户端配置。完整参数与 MCP 说明见 [只读聊天查询](docs/chatlog.md)。
+安装器只授予查询所需表的 `SELECT`；配置写入 `~/.config/chatlog/config.json`（0600），不保存到客户端配置。MCP 的 `media` 工具可把本机图片的 JPEG 预览交给 AI 客户端，默认关闭，需用户显式运行 `scripts/chatlog_media_consent.py grant` 授权（可随时 revoke）。完整参数与 MCP 说明见 [只读聊天查询](docs/chatlog.md)。
 
 ## 可选：本地语音转写
 

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = Path.home() / '.config/chatlog/config.json'
+MEDIA_CONSENT = Path.home() / '.config/chatlog/media-consent.json'
 DATABASES = {'wechat': 'wx_chat', 'wecom': 'wecom_chat'}
 TABLES = ('accounts', 'chats', 'contacts', 'chat_members', 'messages',
           'message_raw', 'message_links', 'media_items', 'image_captions', 'blob_parts',
@@ -42,6 +43,29 @@ def load_config(path=None):
         raise QueryError('not_installed', '缺少只读配置；请运行项目的 scripts/install_chatlog.py') from None
     except (OSError, ValueError, TypeError, AttributeError):
         raise QueryError('invalid_config', '只读配置不可读或无效；不会回退到管理员账号') from None
+
+
+def media_consent(path=None):
+    """读取「图片可回传给 AI 客户端」的显式授权。
+
+    返回授权内容 dict，或 None（未授权）。文件必须是当前用户所有、权限 0600 的
+    普通文件，且 ``image_external_consent`` 为 true；任何缺失或不安全状态都按
+    未授权处理，不抛异常、不影响普通文本查询。授权由
+    ``scripts/chatlog_media_consent.py grant`` 写入，便于用户撤销和审计。
+    """
+    path = Path(path or MEDIA_CONSENT)
+    try:
+        if path.is_symlink():
+            return None
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid():
+            return None
+        consent = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(consent, dict) or consent.get('image_external_consent') is not True:
+        return None
+    return consent
 
 
 def reference(platform, kind, pk):

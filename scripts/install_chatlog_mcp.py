@@ -112,6 +112,7 @@ def install():
     new_harness = patch_harness(old_harness) if have_harness else old_harness
     if (not have_codex or existing) and new_harness == old_harness:
         print('已注册的客户端配置 chatlog MCP；无需修改。')
+        print('MCP 图片回传默认关闭；需要 AI 看本机图片时运行 scripts/chatlog_media_consent.py grant。')
         return
     saved = backup({'codex-config.toml': codex_path, 'dsh-cordis.patch.yml': harness_path})
     if have_codex and not existing:
@@ -126,6 +127,7 @@ def install():
     print('已注册本机 chatlog MCP：' + '、'.join(name for name, present in (('Codex', have_codex), ('Deepseekharness', have_harness)) if present))
     print('配置备份：' + str(saved))
     print('已运行的客户端可能需要重新加载 MCP 或重开会话。')
+    print('MCP 图片回传默认关闭；需要 AI 看本机图片时运行 scripts/chatlog_media_consent.py grant。')
 
 
 if __name__ == '__main__':

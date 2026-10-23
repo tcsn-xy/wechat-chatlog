@@ -15,6 +15,17 @@ MESSAGE_COLUMNS = ('m.id,m.platform,m.account_key,m.chat_pk,m.chat_id,m.ts,m.kin
                    'm.sender_id,m.sender_name,m.text,m.source_dataset,m.source_db,'
                    'm.source_table,m.local_id,m.server_id,m.has_media,m.has_link')
 
+MEDIA_COLUMNS = ('i.id,i.platform,i.account_key,i.message_pk,i.msg_kind,i.media_role,'
+                 'i.file_name,i.mime,i.bytes,i.unavailable,i.reason,'
+                 'i.file_path,i.file_sha256,i.decoded_path,i.decoded_sha256,i.decoded_mime,i.is_thumb,'
+                 "(i.data IS NOT NULL OR EXISTS(SELECT 1 FROM blob_parts b "
+                 "WHERE b.table_name='media_items' AND b.row_id=i.id)) AS stored_blob")
+
+# 可以尝试生成图片预览的媒体类型；其余类型（音视频、文件）不返回图片内容。
+IMAGE_KINDS = ('image', 'sticker', 'emotion', 'thumb')
+# 一次查询最多回传多少张预览，避免单条消息的图片把模型上下文挤满。
+MAX_PREVIEW_IMAGES = 4
+
 
 def connect(config, database):
     c = pymysql.connect(host=config['host'], port=config['port'], user=config['user'],
@@ -62,9 +73,12 @@ class Reader:
         self.platforms = list(DATABASES) if args.platform == 'all' else [args.platform]
         target = getattr(args, 'reference', None) or args.chat
         if args.platform == 'all' and target:
-            if target.startswith(('wechat:chat:', 'wecom:chat:', 'wechat:message:', 'wecom:message:')):
+            if target.startswith(('wechat:chat:', 'wecom:chat:', 'wechat:message:', 'wecom:message:',
+                                  'wechat:media:', 'wecom:media:')):
                 self.platforms = [target.split(':')[0]]
         self.key = decode_cursor(args)
+        # media 命令把预览字节放在这里，由 CLI/MCP 层取走，不进 JSON 元数据。
+        self.preview_images = []
         self.chat = None
         if args.since and args.until and timestamp(args.since) >= timestamp(args.until):
             raise QueryError('invalid_time_range', '--since 必须早于 --until（结束时间不包含在内）')
@@ -286,16 +300,46 @@ class Reader:
             return [], None
 
     def media(self, c, message):
-        rows = select(c, """SELECT i.id,i.msg_kind,i.media_role,i.file_name,i.mime,i.bytes,i.unavailable,i.reason,
-          i.file_path,i.file_sha256,i.decoded_path,i.decoded_sha256,i.decoded_mime,i.is_thumb,
-          (i.data IS NOT NULL OR EXISTS(SELECT 1 FROM blob_parts b WHERE b.table_name='media_items' AND b.row_id=i.id)) AS stored_blob
-          FROM media_items i WHERE i.message_pk=%s AND i.platform=%s AND i.account_key=%s ORDER BY i.id""",
-          [message['id'], message['platform'], message['account_key']])
+        rows = self._select_media(c, message['platform'], message['account_key'], message_pk=message['id'])
+        return self.decorate_media(c, rows, message=message)
+
+    def _select_media(self, c, platform, account_key=None, media_id=None, message_pk=None):
+        where, params = 'i.platform=%s', [platform]
+        if account_key:
+            where += ' AND i.account_key=%s'
+            params.append(account_key)
+        if media_id is not None:
+            where += ' AND i.id=%s'
+            params.append(media_id)
+        if message_pk is not None:
+            where += ' AND i.message_pk=%s'
+            params.append(message_pk)
+        return select(c, 'SELECT ' + MEDIA_COLUMNS + ' FROM media_items i WHERE ' + where + ' ORDER BY i.id', params)
+
+    def decorate_media(self, c, rows, message=None):
+        """补齐媒体行的引用、路径状态、caption、语音转写和 viewable 提示。
+
+        路径只从项目受管理的 ``media_store/`` 解析；绝对路径和越界路径一律置空，
+        不把数据库内容写到文件系统。``viewable`` 只是“可尝试预览”的提示，
+        真正能否解码由 media 命令逐张验证。
+        """
         base = (self.root / 'media_store').resolve()
-        for row in rows:
-            row['platform'], row['account_key'] = message['platform'], message['account_key']
-            row['message_ref'], row['chat_ref'] = message['message_ref'], message['chat_ref']
-            row['media_ref'] = reference(message['platform'], 'media', row['id'])
+        chat_pks = {}
+        decorated = []
+        for raw in rows:
+            row = dict(raw)
+            platform, account = row['platform'], row['account_key']
+            message_pk = row.get('message_pk')
+            row['message_ref'] = reference(platform, 'message', message_pk) if message_pk else None
+            if message is not None:
+                row['chat_ref'] = message.get('chat_ref')
+            else:
+                if message_pk and message_pk not in chat_pks:
+                    found = select(c, 'SELECT chat_pk FROM messages WHERE platform=%s AND id=%s', [platform, message_pk])
+                    chat_pks[message_pk] = found[0]['chat_pk'] if found else None
+                chat_pk = chat_pks.get(message_pk) if message_pk else None
+                row['chat_ref'] = reference(platform, 'chat', chat_pk) if chat_pk else None
+            row['media_ref'] = reference(platform, 'media', row['id'])
             row['storage'] = 'file' if row['file_path'] else ('database_blob' if row['stored_blob'] else 'missing')
             row['file_status'] = 'missing' if row['storage'] == 'missing' else 'not_verified'
             for column in ('file_path', 'decoded_path'):
@@ -315,11 +359,120 @@ class Reader:
             row.pop('file_sha256', None)
             row['captions'] = select(c, 'SELECT prompt_version,status,caption,image_text,error_code,completed_at FROM image_captions '
                                       'WHERE platform=%s AND account_key=%s AND image_sha256=%s ORDER BY id DESC',
-                                      [message['platform'], message['account_key'], sha]) if sha else []
+                                      [platform, account, sha]) if sha else []
             row['caption_status'] = row['captions'][0]['status'] if row['captions'] else 'not_available'
+            row['viewable'] = bool(row['msg_kind'] in IMAGE_KINDS and row['storage'] == 'file'
+                                   and (row.get('decoded_path_status') == 'exists_not_verified'
+                                        or row.get('file_path_status') == 'exists_not_verified'))
             if row['msg_kind'] == 'voice':
-                row['voice_transcripts'] = self.transcripts(c, message, row['id'])
-        return rows
+                stub = dict(id=message_pk or 0, platform=platform, account_key=account)
+                row['voice_transcripts'] = self.transcripts(c, stub, row['id'])
+            decorated.append(row)
+        return decorated
+
+    def parse_media_reference(self, value):
+        for kind in ('media', 'message'):
+            if isinstance(value, str) and value.startswith(('wechat:' + kind + ':', 'wecom:' + kind + ':')):
+                platform, pk = self.check_ref(value, kind)
+                return platform, kind, pk
+        raise QueryError('invalid_reference', '需要明确引用，例如 wechat:media:123 或 wechat:message:123')
+
+    def _select_message(self, c, platform, pk):
+        where, params = 'm.platform=%s AND m.id=%s', [platform, pk]
+        if self.args.account:
+            where += ' AND m.account_key=%s'
+            params.append(self.args.account)
+        rows = select(c, 'SELECT m.id,m.platform,m.account_key,m.chat_pk,m.chat_id,m.ts FROM messages m WHERE ' + where, params)
+        if not rows:
+            return None
+        row = dict(rows[0])
+        row['message_ref'] = reference(platform, 'message', row['id'])
+        row['chat_ref'] = reference(platform, 'chat', row['chat_pk']) if row.get('chat_pk') else None
+        return row
+
+    def _preview_source(self, row):
+        for column in ('decoded_path', 'file_path'):
+            value = row.get(column)
+            if value and row.get(column + '_status') == 'exists_not_verified':
+                return Path(value)
+        return None
+
+    def media_view(self, reference, max_edge):
+        """按媒体引用或消息引用取图片并逐张生成 JPEG 预览。
+
+        单图失败只记在对应 media 行的 ``preview.error``，不中止整条查询；
+        全部失败时把首个失败写入 errors（CLI 退出码 4、MCP isError）。
+        预览字节放在 ``self.preview_images``，JSON 结果只带元数据。
+        """
+        platform, kind, pk = self.parse_media_reference(reference)
+        missing = {}
+
+        def fetch(p, c):
+            if kind == 'media':
+                rows = self._select_media(c, p, self.args.account or None, media_id=pk)
+                if not rows:
+                    missing.update(code='media_not_found', message='没有找到媒体行；先用 message 查看该消息的 media_ref')
+                    return []
+                return self.decorate_media(c, rows)
+            message = self._select_message(c, p, pk)
+            if message is None:
+                missing.update(code='message_not_found', message='未找到消息，或消息不属于所选账号')
+                return []
+            rows = [row for row in self._select_media(c, p, message['account_key'], message_pk=pk)
+                    if row['msg_kind'] in IMAGE_KINDS]
+            if not rows:
+                missing.update(code='no_image_media', message='这条消息没有已入库的图片媒体；可先用 message 查看 media 列表')
+                return []
+            return self.decorate_media(c, rows, message=message)
+
+        rows = self.attempt(fetch, [platform])
+        if not rows and missing:
+            raise QueryError(missing['code'], missing['message'])
+        if not rows:
+            if any(error['platform'] == platform for error in self.errors):
+                return [], None
+            raise QueryError('media_not_found', '没有找到可查看的媒体')
+
+        failures = []
+        for index, row in enumerate(rows):
+            if kind == 'message' and index >= MAX_PREVIEW_IMAGES:
+                row['preview'] = dict(available=False, skipped=True,
+                                      reason=f'一次最多返回 {MAX_PREVIEW_IMAGES} 张图片预览；可用 media_ref 单张查看')
+                continue
+            source = self._preview_source(row)
+            if source is None:
+                error = dict(code='image_unavailable',
+                             message='本机没有可读取的图片缓存文件；caption 不代表图片内容已补齐')
+                row['preview'] = dict(available=False, error=error)
+                failures.append(error)
+                self.warnings.append(row['media_ref'] + '：' + error['message'])
+                continue
+            try:
+                from .preview import render_preview
+                preview = render_preview(source, max_edge=max_edge)
+            except QueryError as exc:
+                row['preview'] = dict(available=False, error=exc.detail)
+                failures.append(exc.detail)
+                self.warnings.append(row['media_ref'] + '：' + exc.detail['message'])
+                continue
+            except Exception:
+                error = dict(code='media_preview_failed', message='图片预览生成失败；请重试或换一张')
+                row['preview'] = dict(available=False, error=error)
+                failures.append(error)
+                self.warnings.append(row['media_ref'] + '：' + error['message'])
+                continue
+            data = preview.pop('data')
+            row['preview'] = dict(preview, available=True)
+            self.preview_images.append(dict(row_index=index, media_ref=row['media_ref'],
+                                            message_ref=row.get('message_ref'),
+                                            mime=preview['mime'], data=data))
+        if not self.preview_images:
+            first = failures[0] if failures else dict(code='image_unavailable', message='没有可返回的图片')
+            self.errors.append(dict(first, platform=platform))
+        if any(row['preview'].get('skipped') for row in rows):
+            skipped = sum(1 for row in rows if row['preview'].get('skipped'))
+            self.warnings.append(f'{skipped} 张图片未返回预览（单次上限 {MAX_PREVIEW_IMAGES}）；可用 media_ref 单张查看')
+        return rows, None
 
     def transcripts(self, c, message, media_id=None):
         params = [message['id'], message['platform'], message['account_key']]
@@ -369,6 +522,8 @@ class Reader:
     def run(self):
         if self.args.command == 'status':
             return self.status()
+        if self.args.command == 'media':
+            return self.media_view(self.args.reference, self.args.max_size)
         if self.args.command in ('message', 'context'):
             return self.message(self.args.reference)
         return self.listing()

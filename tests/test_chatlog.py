@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -13,9 +14,10 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'scripts'), str(ROOT / 'lib')]
 import pymysql
+from PIL import Image
 from mysql_store import conn as admin, schema, files
-from chatlog_core.cli import main, parser, capabilities
-from chatlog_core.common import QueryError, load_config, timestamp, safe_error, TABLES
+from chatlog_core.cli import main, parser, capabilities, prepare_output
+from chatlog_core.common import QueryError, load_config, timestamp, safe_error, TABLES, media_consent
 from chatlog_core.query import Reader, connect, select
 from install_chatlog import validate_grants
 import voice_asr_core as asr
@@ -36,10 +38,46 @@ class UnitTests(unittest.TestCase):
                 self.assertEqual(main(['capabilities', '--json']), 0)
             result = json.loads(out.getvalue())
             self.assertTrue(result['data']['read_only'])
-            self.assertEqual(set(result['data']['commands']), {'status','chats','contacts','members','messages','search','context','message','capabilities'})
+            self.assertEqual(result['data']['version'], '1.1.0')
+            self.assertEqual(set(result['data']['commands']), {'status','chats','contacts','members','messages','search','context','message','media','capabilities'})
+            self.assertIn('out', {item['name'] for item in result['data']['commands']['media']['parameters']})
+
+    def test_media_consent_requires_private_optin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'consent.json'
+            self.assertIsNone(media_consent(path))
+            path.write_text(json.dumps({'image_external_consent': True}))
+            path.chmod(0o644)
+            self.assertIsNone(media_consent(path))
+            path.chmod(0o600)
+            self.assertTrue(media_consent(path)['image_external_consent'])
+            path.write_text(json.dumps({'image_external_consent': False}))
+            self.assertIsNone(media_consent(path))
+            target = Path(directory) / 'real.json'
+            target.write_text(json.dumps({'image_external_consent': True}))
+            target.chmod(0o600)
+            link = Path(directory) / 'link.json'
+            link.symlink_to(target)
+            self.assertIsNone(media_consent(link))
+
+    def test_preview_output_path_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'media_store' / 'images').mkdir(parents=True)
+            (root / 'previews').mkdir()
+            with self.assertRaises(QueryError):
+                prepare_output(str(root / 'media_store' / 'images' / 'x.jpg'), root)
+            target = root / 'previews' / 'x.jpg'
+            self.assertEqual(prepare_output(str(target), root), target)
+            (root / 'previews' / 'link.jpg').symlink_to(root / 'previews' / 'missing.jpg')
+            with self.assertRaises(QueryError):
+                prepare_output(str(root / 'previews' / 'link.jpg'), root)
+            with self.assertRaises(QueryError):
+                prepare_output(str(root / 'nope' / 'x.jpg'), root)
 
     def test_invalid_arguments_json(self):
-        for args in (['messages','--limit','201'], ['search',''], ['messages','--since','no-date'], ['message','wechat:message:1','--raw-offset','2']):
+        for args in (['messages','--limit','201'], ['search',''], ['messages','--since','no-date'], ['message','wechat:message:1','--raw-offset','2'],
+                     ['media'], ['media','wechat:media:1','--max-size','100'], ['media','wechat:media:1','--max-size','4096']):
             with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(main(args + ['--json']), 2)
             self.assertFalse(json.loads(out.getvalue())['ok'])
@@ -85,6 +123,11 @@ class DatabaseTests(unittest.TestCase):
         cls.grant_host = '%'
         cls.temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.cleanup)
+        media_root = Path(cls.temp.name) / 'media_store' / 'images'
+        media_root.mkdir(parents=True)
+        Image.new('RGB', (800, 400), (200, 40, 40)).save(media_root / 'synthetic.png')
+        Image.new('RGB', (800, 400), (40, 200, 40)).save(media_root / 'synthetic_decoded.jpg')
+        (media_root / 'synthetic-not-image.bin').write_bytes(b'synthetic bytes, not an image')
         with admin.connect() as c:
             with c.cursor() as cur:
                 cur.execute('CREATE USER %s@%s IDENTIFIED BY %s', [cls.user, cls.grant_host, cls.password])
@@ -132,6 +175,24 @@ class DatabaseTests(unittest.TestCase):
             cur.execute('INSERT INTO media_items(platform,account_key,message_pk,msg_kind,ext,file_path,file_sha256) VALUES(%s,%s,3,%s,%s,%s,%s)',
                         [p,'fixture_a','voice','wav','synthetic.wav','c'*64])
             voice_id = cur.lastrowid
+            # 合成图片媒体：可视图（decoded 优先）、非图片、缺失文件，供 media 命令测试。
+            cur.execute('INSERT INTO media_items(platform,account_key,message_pk,msg_kind,file_path,decoded_path,file_sha256,decoded_sha256) '
+                        'VALUES(%s,%s,4,%s,%s,%s,%s,%s)',
+                        [p,'fixture_a','image','images/synthetic.png','images/synthetic_decoded.jpg','f'*64,'e'*64])
+            cur.execute('INSERT INTO image_captions(platform,account_key,image_sha256,prompt_version,endpoint,status,caption,image_text) '
+                        'VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',
+                        [p,'fixture_a','e'*64,'fixture','local','complete','合成可视图','预览测试'])
+            cur.execute('INSERT INTO media_items(platform,account_key,message_pk,msg_kind,file_path,file_sha256) VALUES(%s,%s,5,%s,%s,%s)',
+                        [p,'fixture_a','image','images/synthetic-not-image.bin','d'*64])
+            cur.execute('INSERT INTO media_items(platform,account_key,message_pk,msg_kind,file_path,file_sha256) VALUES(%s,%s,5,%s,%s,%s)',
+                        [p,'fixture_a','image','images/absent.jpg','b'*64])
+            for _ in range(2):
+                cur.execute('INSERT INTO media_items(platform,account_key,message_pk,msg_kind,file_path,file_sha256) VALUES(%s,%s,6,%s,%s,%s)',
+                            [p,'fixture_a','image','images/synthetic.png','f'*64])
+            cur.execute('INSERT INTO media_items(platform,account_key,message_pk,msg_kind,file_path,file_sha256) VALUES(%s,%s,7,%s,%s,%s)',
+                        [p,'fixture_a','image','images/synthetic.png','f'*64])
+            cur.execute('INSERT INTO media_items(platform,account_key,message_pk,msg_kind,file_path,file_sha256) VALUES(%s,%s,7,%s,%s,%s)',
+                        [p,'fixture_a','image','images/absent7.jpg','b'*64])
         c.commit()
         asr.seed_batch(c, dict(batch_id='synthetic-voice', items={p:[dict(id=voice_id,platform=p,account_key='fixture_a',
             message_pk=3,ext='wav',file_path='synthetic.wav',file_sha256='c'*64)]}), 'd'*64, p)
@@ -208,6 +269,118 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         rows, _ = self.run_query(['search','原文2','--scope','raw'])
         self.assertEqual(len(rows), 2)
+
+    def test_media_command_previews_and_caption(self):
+        rows, _ = self.run_query(['media','wechat:message:4'])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(row['viewable'])
+        self.assertTrue(row['preview']['available'])
+        self.assertEqual((row['preview']['preview_width'], row['preview']['preview_height']), (800, 400))
+        self.assertEqual(row['preview']['mime'], 'image/jpeg')
+        self.assertEqual(row['preview']['decode_path'], 'direct')
+        self.assertEqual(row['captions'][0]['caption'], '合成可视图')
+        self.assertEqual(row['message_ref'], 'wechat:message:4')
+        self.assertEqual(row['chat_ref'], 'wechat:chat:1')
+        # 消息详情里的 media 行带 viewable 提示，但不含图片字节。
+        detail, _ = self.run_query(['message','wechat:message:4'])
+        self.assertTrue(detail[0]['media'][0]['viewable'])
+        self.assertNotIn('preview', detail[0]['media'][0])
+        # 单媒体引用与 --max-size 缩放。
+        rows, _ = self.run_query(['media', row['media_ref'], '--max-size','256'])
+        self.assertEqual((rows[0]['preview']['preview_width'], rows[0]['preview']['preview_height']), (256, 128))
+
+    def test_media_cli_out_writes_preview_and_rejects_media_store(self):
+        rows, _ = self.run_query(['media','wechat:message:4'])
+        ref = rows[0]['media_ref']
+        config = dict(host='127.0.0.1', port=int(os.environ.get('WX_MYSQL_PORT',3306)), user=self.user, password=self.password)
+
+        def make_reader(_config, args):
+            return Reader(_config, args, databases=self.databases, root=self.temp.name)
+
+        out_dir = Path(self.temp.name) / 'previews'
+        out_dir.mkdir()
+        target = out_dir / 'preview.jpg'
+        with patch('chatlog_core.cli.load_config', return_value=config), patch('chatlog_core.cli.Reader', side_effect=make_reader), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = main(['media', ref, '--out', str(target), '--json'])
+        self.assertEqual(code, 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual(result['data'][0]['output_path'], str(target))
+        self.assertEqual(result['data'][0]['output_bytes'], target.stat().st_size)
+        with Image.open(target) as image:
+            self.assertEqual(image.format, 'JPEG')
+            self.assertEqual(image.size, (800, 400))
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        forbidden = Path(self.temp.name) / 'media_store' / 'images' / 'preview.jpg'
+        with patch('chatlog_core.cli.load_config', return_value=config), patch('chatlog_core.cli.Reader', side_effect=make_reader), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = main(['media', ref, '--out', str(forbidden), '--json'])
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out.getvalue())['errors'][0]['code'], 'invalid_output_path')
+        self.assertFalse(forbidden.exists())
+
+    def test_media_out_requires_single_image(self):
+        rows, _ = self.run_query(['media','wechat:message:6'])
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row['preview']['available'] for row in rows))
+        config = dict(host='127.0.0.1', port=int(os.environ.get('WX_MYSQL_PORT',3306)), user=self.user, password=self.password)
+
+        def make_reader(_config, args):
+            return Reader(_config, args, databases=self.databases, root=self.temp.name)
+
+        target = Path(self.temp.name) / 'multi.jpg'
+        with patch('chatlog_core.cli.load_config', return_value=config), patch('chatlog_core.cli.Reader', side_effect=make_reader), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = main(['media','wechat:message:6','--out',str(target),'--json'])
+        self.assertEqual(code, 2)
+        result = json.loads(out.getvalue())
+        self.assertEqual([error['code'] for error in result['errors']], ['out_requires_single_image'])
+        self.assertFalse(result['ok'])
+        self.assertFalse(target.exists())
+
+    def test_media_partial_success_keeps_viewable_and_warns(self):
+        reader = self.reader(['media','wechat:message:7'])
+        rows, _ = reader.run()
+        self.assertEqual(reader.errors, [])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sum(1 for row in rows if row['preview']['available']), 1)
+        self.assertTrue(reader.warnings)
+        config = dict(host='127.0.0.1', port=int(os.environ.get('WX_MYSQL_PORT',3306)), user=self.user, password=self.password)
+
+        def make_reader(_config, args):
+            return Reader(_config, args, databases=self.databases, root=self.temp.name)
+
+        with patch('chatlog_core.cli.load_config', return_value=config), patch('chatlog_core.cli.Reader', side_effect=make_reader), \
+             contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = main(['media','wechat:message:7','--json'])
+        result = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['warnings'])
+
+    def test_media_unavailable_rows_reported_not_crashed(self):
+        with self.assertRaises(QueryError) as exc:
+            self.reader(['media','wechat:message:1']).run()
+        self.assertEqual(exc.exception.detail['code'], 'no_image_media')
+        with self.assertRaises(QueryError) as exc:
+            self.reader(['media','wechat:media:999999']).run()
+        self.assertEqual(exc.exception.detail['code'], 'media_not_found')
+        with self.assertRaises(QueryError) as exc:
+            self.reader(['media','wechat:chat:1']).run()
+        self.assertEqual(exc.exception.detail['code'], 'invalid_reference')
+        reader = self.reader(['media','wechat:message:5'])
+        rows, _ = reader.run()
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(any(row['preview']['available'] for row in rows))
+        codes = {row['preview']['error']['code'] for row in rows}
+        self.assertIn('image_unavailable', codes)
+        self.assertIn('media_not_image', codes)
+        self.assertEqual(reader.errors[0]['code'], 'media_not_image')
+        detail, _ = self.run_query(['message','wechat:message:3'])
+        reader = self.reader(['media', detail[0]['media'][0]['media_ref']])
+        rows, _ = reader.run()
+        self.assertEqual(rows[0]['preview']['error']['code'], 'image_unavailable')
 
     def test_contacts_members_and_missing_message(self):
         rows, _ = self.run_query(['contacts','备注'])

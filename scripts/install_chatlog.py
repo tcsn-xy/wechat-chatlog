@@ -105,6 +105,7 @@ def install():
     print('已安装 ' + str(launcher))
     print('只读账号已验证：仅两个聊天库所需表的 SELECT 权限。')
     print('运行 chatlog --help 或 chatlog capabilities --json。')
+    print('MCP 图片回传默认关闭；需要 AI 看本机图片时运行 scripts/chatlog_media_consent.py grant。')
 
 
 if __name__ == '__main__':
