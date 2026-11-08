@@ -3,7 +3,7 @@
 macOS 上读取**本人设备、本人账号**的微信 4.x / 企业微信 5.x 本机数据，提供两个核心能力：
 
 1. **聊天记录导出**：抓取本机快照与密钥，导出 HTML / TXT / CSV，带图片、语音、视频、文件和表情；可导入本机 MySQL，支持每小时全来源核验与准实时文字同步。
-2. **chatlog 只读查询**：把已入库记录交给 `chatlog` CLI 或本机 stdio MCP，供人和 AI 检索正文、原文、链接、语音转写、已有图片描述，并可按需查看本机图片的 JPEG 预览；不发送消息、不同步、不导出数据库 BLOB。
+2. **chatlog 查询与消息发送**：通过 CLI 或本机 stdio MCP 检索已入库记录、链接、转写和媒体信息，按需取出本机已有附件供阅读；配置本机发送后端后，可向精确会话显式发送文字，图片和文件须该平台原生后端另行验证支持。聊天库仍只读；附件仅写导出副本，不发起远程下载。
 
 > 本项目不是腾讯官方 SDK。只应用于本人账号在本人设备上的数据；请遵守当地法律与客户端服务条款，不要用它导出或传播他人的聊天记录。
 >
@@ -17,7 +17,8 @@ macOS 上读取**本人设备、本人账号**的微信 4.x / 企业微信 5.x �
 - 每小时全来源核验 + 准实时文字同步 + 独立媒体采集；后台任务由 `launchd` 管理。
 - 可选图片描述/OCR（MiniMax Coding Plan，默认关闭，必须显式授权图片外发）。
 - 可选本地语音转写（Qwen3-ASR，独立 `.venv-asr`，离线运行，只处理冻结批次）。
-- 可选只读 `chatlog` CLI 与 MCP（10 个只读工具，不暴露任意 SQL、shell 或路径读取；MCP 回传图片需用户显式授权）。
+- 可选 `chatlog` CLI 与 MCP（15 个工具，含只读查询、附件导出和显式文字发送；不暴露任意 SQL、shell 或路径读取，MCP 回传图片需用户显式授权）。
+- 可选 [MiniMax 语义检索](docs/semantic-search.md)：按意思查历史、同义表达和相关讨论；文字外发须显式授权，索引只存本机。AI 应按语义问题优先使用 `semantic_search`，并用原消息和上下文核实。
 
 没有缓存的媒体不能凭空恢复；客户端版本、TCC 权限、重新登录和副本签名都会影响可用性。**不保证所有版本通用，也不对外宣称“全部导出了”**。
 
@@ -80,7 +81,9 @@ sudo ./.venv/bin/python scripts/capture_keys.py --keep-copy
 
 细节：[信息存入与后台同步](docs/storage.md)、[媒体与 caption](docs/media-caption.md)、[故障排查与验证](docs/troubleshooting.md)。
 
-## chatlog：只读查询 CLI / MCP
+## chatlog：查询与文字发送 CLI / MCP
+
+不知道有哪些功能？运行 `chatlog capabilities`，或直接对 AI 说“找他发的合同并读一下”“看这张聊天图片”“查语音里提过的内容”。AI 首次使用应先查看 `capabilities.feature_guide`，再核实当前状态；完整场景见 [功能清单](docs/chatlog.md#不知道还能做什么)。文件可取出本机已有副本，未缓存内容不能远程补下载。
 
 完成入库后，用专用只读账号安装：
 
@@ -94,14 +97,20 @@ chatlog messages --chat wechat:chat:123 --since 2026-10-01 --json
 chatlog media wechat:message:123 --json    # 看该消息的本机图片预览
 ```
 
-只读 MCP（可选，需要 `requirements-mcp.txt`）：
+MCP（可选，需要 `requirements-mcp.txt`）：
 
 ```bash
 ./.venv/bin/python -m pip install -r requirements-mcp.txt
 ./.venv/bin/python scripts/install_chatlog_mcp.py
 ```
 
-安装器只授予查询所需表的 `SELECT`；配置写入 `~/.config/chatlog/config.json`（0600），不保存到客户端配置。MCP 的 `media` 工具可把本机图片的 JPEG 预览交给 AI 客户端，默认关闭，需用户显式运行 `scripts/chatlog_media_consent.py grant` 授权（可随时 revoke）。完整参数与 MCP 说明见 [只读聊天查询](docs/chatlog.md)。
+安装器只授予查询所需表的 `SELECT`；配置写入 `~/.config/chatlog/config.json`（0600），不保存到客户端配置。MCP 的 `media` 工具可把本机图片的 JPEG 预览交给 AI 客户端，默认关闭，需用户显式运行 `scripts/chatlog_media_consent.py grant` 授权（可随时 revoke）。`send` 需要另外配置本机原生发送后端与账号绑定；公开源码包不包含这些私有后端。完整参数与说明见 [chatlog](docs/chatlog.md)。
+
+`send` 和 `bridge reply` 的有序本机附件、批量收据与逐类型验证门槛见 [图片、文件与批量回复](docs/sending-media.md)。
+
+可选 [桌面 Codex 桥接](docs/bridge.md)：`chatlog bridge install` 安装本机后台，`chatlog bridge open` 打开授权管理页。由你按人选择工作空间和已有 Codex 会话，命中口令与真实 @规则后进入桌面原生队列，回答通过 chatlog 回到原聊天。默认暂停、联系人默认不启用。
+
+桥接也支持 dsh 原生队列。联系人与绑定可直接通过 `chatlog bridge people`、`workspaces`、`sessions`、`bind`、`backend use` 管理，保留 Codex/dsh 两套目标并显式切换；`perf --seconds 60` 可测常驻占用。命令行是完整管理入口，页面为可选入口，详见 [CLI 与常驻配置](docs/bridge.md)。
 
 ## 可选：本地语音转写
 

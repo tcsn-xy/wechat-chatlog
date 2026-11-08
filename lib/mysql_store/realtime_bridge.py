@@ -5,9 +5,19 @@ import os
 from pathlib import Path
 import time
 import uuid
+import socket
 from localio import atomic_json
 ROOT=Path(__file__).resolve().parents[2]
 STATE=ROOT/'.runtime/chat-watch-sync'
+
+
+def notify(platform,ids,detected_unix):
+    # Hint only: recipients still read committed MySQL rows using durable cursors.
+    path=Path.home()/'.local/share/chatlog/bridge/notify.sock'
+    try:
+        with socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM) as s:
+            s.settimeout(.05);s.sendto(json.dumps(dict(platform=platform,ids=ids,detected_unix=detected_unix)).encode(),str(path))
+    except OSError:pass
 
 
 def read(platform):

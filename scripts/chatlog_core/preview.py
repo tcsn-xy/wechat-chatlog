@@ -62,8 +62,18 @@ def render_preview(path, *, max_edge: int = DEFAULT_MAX_EDGE, quality: int = DEF
     校正后的源图显示尺寸）、``preview_width``/``preview_height``（输出尺寸）、``source_bytes``、
     ``source_format``、``decode_path``、``warnings``；失败抛 ``QueryError``，错误码见模块文档。
     """
-    edge, level = _params(max_edge, quality)
     data, source_bytes = _read_source(path)
+    return render_preview_bytes(data, max_edge=max_edge, quality=quality)
+
+
+def render_preview_bytes(data, *, max_edge=DEFAULT_MAX_EDGE, quality=DEFAULT_QUALITY):
+    """Decode an already bounded database image without creating a temporary file."""
+    edge, level = _params(max_edge, quality)
+    source_bytes = len(data)
+    if source_bytes > MAX_SOURCE_BYTES:
+        raise QueryError('media_too_large', '图片超过预览字节上限')
+    if not data:
+        raise QueryError('media_not_image', '图片数据为空')
     image, source_format, decode_path, warnings = _decode(data)
     image, normalize_warnings = _normalize(image)
     warnings.extend(normalize_warnings)

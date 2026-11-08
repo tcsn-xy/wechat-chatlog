@@ -33,11 +33,13 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 
 from . import cdp as _cdp
 
 # 这两个子进程都是企业微信的孩子，都继承沙盒；WeDrive 那个更独立，优先用
 NODE_HINTS = ("WeDrive/res/node.js", "wemail_node/main.js")
+SIGNED_APP = str(Path(__file__).resolve().parents[2] / '.runtime/WeComSigned.app')
 DEFAULT_PORTS = (9229, 9230, 9231, 9232)
 
 
@@ -54,7 +56,7 @@ def node_processes() -> list:
         pid, _, cmd = line.partition(" ")
         if not pid.isdigit():
             continue
-        if "企业微信.app" not in cmd:
+        if not any(app + '/' in cmd for app in ('企业微信.app', 'WeCom.app', SIGNED_APP)):
             continue
         if any(h in cmd for h in NODE_HINTS):
             found.append((int(pid), cmd.strip()))

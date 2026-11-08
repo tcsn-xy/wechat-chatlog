@@ -21,12 +21,12 @@ GOOD = dict(ok=True, partial=False, data=[], errors=[], warnings=[], pagination=
 
 class AdapterTests(unittest.TestCase):
     def test_readonly_tools_and_schema(self):
-        self.assertEqual(len(TOOLS), 10)
+        self.assertEqual(len(TOOLS), 15)
         for tool in TOOLS:
             wire = tool.model_dump(by_alias=True)
-            self.assertTrue(wire['annotations']['readOnlyHint'])
+            self.assertEqual(wire['annotations']['readOnlyHint'], tool.name not in ('send', 'download'))
             self.assertFalse(wire['annotations']['destructiveHint'])
-            self.assertFalse(wire['annotations']['openWorldHint'])
+            self.assertEqual(wire['annotations']['openWorldHint'], tool.name in ('send', 'semantic_search'))
             self.assertFalse(wire['inputSchema']['additionalProperties'])
         self.assertEqual(DEFINITIONS['members']['schema']['required'], ['chat'])
         self.assertEqual(DEFINITIONS['search']['schema']['required'], ['keyword'])
@@ -148,14 +148,18 @@ class ProtocolTests(unittest.TestCase):
         try:
             response = request(1,'initialize',dict(protocolVersion='2025-11-25',capabilities={},clientInfo=dict(name='chatlog-test',version='1')))
             self.assertEqual(response['result']['protocolVersion'], '2025-11-25')
+            self.assertIn('先调用 capabilities', response['result']['instructions'])
+            self.assertIn('feature_guide', response['result']['instructions'])
             proc.stdin.write(json.dumps(dict(jsonrpc='2.0',method='notifications/initialized'))+'\n');proc.stdin.flush()
             response = request(2,'tools/list',{})
-            self.assertEqual(len(response['result']['tools']),10)
+            self.assertEqual(len(response['result']['tools']),15)
             names = {tool['name'] for tool in response['result']['tools']}
             self.assertIn('media', names)
             response = request(3,'tools/call',dict(name='capabilities',arguments={}))
             self.assertFalse(response['result']['isError'])
             self.assertTrue(response['result']['structuredContent']['ok'])
+            guide = response['result']['structuredContent']['data']['feature_guide']
+            self.assertTrue(any(item['tools'] == ['attachments', 'download'] for item in guide))
             response = request(4,'tools/call',dict(name='messages',arguments={'limit':201}))
             self.assertTrue('error' in response or response['result'].get('isError'))
         finally:

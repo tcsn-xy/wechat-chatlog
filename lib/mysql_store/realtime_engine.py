@@ -13,15 +13,17 @@ from .realtime_sources import row_hash
 class Job:
     def __init__(self,desc,iterator,full=False,event_at=None):
         self.desc=desc;self.iterator=iter(iterator);self.full=full;self.event_at=event_at;self.event_cursor=0
-        self.rows=0;self.max_id=0;self.pending=None;self.chat_counts={}
+        self.rows=0;self.max_id=0;self.pending=None;self.chat_counts={};self.tail=False
     def close(self):
         close=getattr(self.iterator,'close',None)
         if close:close()
 
 
 class Engine:
-    def __init__(self,c,adapter):
-        self.c=c;self.adapter=adapter;self.descriptors={};self.fast=OrderedDict();self.full=OrderedDict();self.cache={}
+    def __init__(self,c,adapter,background_budget=1.0,tail_rows=100,notifications=False):
+        self.c=c;self.adapter=adapter;self.descriptors={};self.fast=OrderedDict();self.full=OrderedDict();self.tail=OrderedDict();self.cache={}
+        self.background_budget=background_budget;self.tail_rows=tail_rows;self.next_background=0
+        self.notifications=notifications
         self.cursors={r['source_key']:r for r in my.query(c,'SELECT * FROM rt_sources')}
         self.results=dict(added=0,updated=0,unchanged=0,stale=0)
         self.latencies=deque(maxlen=2000);self.last_success=None;self.last_full_success=None
@@ -30,35 +32,65 @@ class Engine:
         descriptors,self.unresolved=self.adapter.descriptors(paths,self.c)
         if hasattr(self.adapter,'unresolved_counts'):self.unresolved=sum(self.adapter.unresolved_counts.values())
         descriptors.sort(key=lambda d:d.get('priority_ts',0),reverse=True)
+        fresh=[]
         for desc in descriptors:
             key=store.source_key(desc);old=self.cursors.get(key)
             reset=old and (old['schema_hash']!=desc['schema_hash'] or old['file_identity']!=desc['file_identity'] or desc['max_id']<old['cursor_id'])
             if reset:
                 with store.writer_lock(self.c):
-                    my.execute(self.c,'UPDATE rt_sources SET cursor_id=0,bootstrap=1 WHERE source_key=%s',(key,));self.c.commit()
-                old=dict(old,cursor_id=0,bootstrap=1);self.cursors[key]=old;self.cache.pop(key,None)
+                    my.execute(self.c,'UPDATE rt_sources SET cursor_id=0,bootstrap=1,scan_active=0,scan_cursor=0,scan_rows=0,scan_counts=NULL WHERE source_key=%s',(key,));self.c.commit()
+                old=dict(old,cursor_id=0,bootstrap=1,scan_active=0,scan_cursor=0,scan_rows=0,scan_counts=None);self.cursors[key]=old;self.cache.pop(key,None)
                 if key in self.full:self.full.pop(key).close()
+                if key in self.tail:self.tail.pop(key).close()
             self.descriptors[key]=desc
-            if key in self.fast:self.fast.pop(key).close()
             # A new/restored table prioritizes its tail, while the complete history remains a durable obligation.
             cursor=old['cursor_id'] if old else desc['max_id']
-            def batches(d=desc,start=cursor):
-                yield from self.adapter.rows(d,after=start)
-                yield from self.adapter.rows(d,tail=True)
-            self.fast[key]=Job(desc,batches(),event_at=event_at if old and not reset else None)
-            self.fast[key].event_cursor=cursor
-            if not old or reset or old.get('bootstrap') or force_full:
-                if key not in self.full:self.full[key]=Job(desc,self.adapter.rows(desc,batch_size=100),full=True)
+            if not old or reset or desc['max_id']>cursor:
+                if key not in self.fast or desc['max_id']>self.fast[key].desc['max_id']:
+                    if key in self.fast:self.fast.pop(key).close()
+                    self.fast[key]=Job(desc,self.adapter.rows(desc,after=cursor),event_at=event_at if old and not reset else None)
+                    self.fast[key].event_cursor=cursor;fresh.append(key)
+            if not old or reset or old.get('bootstrap') or old.get('scan_active') or force_full:
+                self.start_full(key,desc,old)
         # Updated/new conversations must not sit behind the initial historical backlog.
-        for desc in reversed(descriptors):self.fast.move_to_end(store.source_key(desc),last=False)
+        for key in reversed(fresh):self.fast.move_to_end(key,last=False)
         if force_full:self.full_requested=True;self.full_active=True
+    def start_full(self,key,desc,old=None):
+        if key in self.full:return
+        old=old or self.cursors.get(key,{})
+        active=old.get('scan_active');after=old.get('scan_cursor',0) if active and old.get('scan_rows',0)>0 else None
+        job=Job(desc,self.adapter.rows(desc,after=after,batch_size=100),full=True)
+        if active:
+            job.rows=old.get('scan_rows',0);counts=old.get('scan_counts') or '{}'
+            job.chat_counts=json.loads(counts) if isinstance(counts,str) else counts
+        self.full[key]=job
+        if old:
+            with store.writer_lock(self.c):
+                my.execute(self.c,'UPDATE rt_sources SET scan_active=1 WHERE source_key=%s',(key,));self.c.commit()
+            old['scan_active']=1
+        self.full_active=True
+    def request_tail(self):
+        if self.tail:return
+        for key,desc in self.descriptors.items():
+            if key not in self.tail:
+                job=Job(desc,self.adapter.rows(desc,tail=True,batch_size=100,tail_limit=self.tail_rows));job.tail=True;self.tail[key]=job
     def request_full(self):
         self.full_requested=True;self.full_active=True
         for key,desc in self.descriptors.items():
-            if key not in self.full:self.full[key]=Job(desc,self.adapter.rows(desc,batch_size=100),full=True)
+            self.start_full(key,desc)
     def step(self):
-        if self.full and (not self.fast or self.fast_steps>=4):jobs=self.full;self.fast_steps=0
-        else:jobs=self.fast;self.fast_steps+=1
+        due=time.monotonic()>=self.next_background
+        background=self.tail if self.tail else self.full
+        if background and due and (not self.fast or self.fast_steps>=4):jobs=background;self.fast_steps=0
+        elif self.fast:jobs=self.fast;self.fast_steps+=1
+        elif background:return False
+        else:jobs=self.fast
+        started=time.monotonic()
+        try:return self._step(jobs)
+        finally:
+            if jobs is not self.fast and self.background_budget<1:
+                self.next_background=time.monotonic()+(time.monotonic()-started)*(1/self.background_budget-1)
+    def _step(self,jobs):
         if not jobs:
             if self.full_active and not self.unresolved:
                 self.last_full_success=dt.datetime.now().isoformat();self.full_active=False;self.full_requested=False
@@ -68,7 +100,7 @@ class Engine:
             try:job.pending=next(job.iterator)
             except StopIteration:
                 cursor=self.cursors.get(key,{}).get('cursor_id',0)
-                if not job.full:cursor=max(cursor,desc['max_id'])
+                if not job.full and not job.tail:cursor=max(cursor,desc['max_id'])
                 if job.full:self.register_source(desc,job.rows,job.chat_counts)
                 result=store.write_batch(self.c,desc,[],cursor,desc['entry']['revision'],complete=job.full,checked_rows=job.rows)
                 self.cursors[key]=my.query(self.c,'SELECT * FROM rt_sources WHERE source_key=%s',(key,))[0]
@@ -88,11 +120,17 @@ class Engine:
                 record=self.adapter.decode(desc,row);record['_source_counter']=row[0];records.append(record)
             seen.append((row[0],digest))
         cursor=self.cursors.get(key,{}).get('cursor_id',0)
-        if not job.full:cursor=max(cursor,max((r[0] for r in rows),default=cursor))
-        result=store.write_batch(self.c,desc,records,cursor,desc['entry']['revision'],verify_existing=job.full)
+        if not job.full and not job.tail:cursor=max(cursor,max((r[0] for r in rows),default=cursor))
+        counts=dict(job.chat_counts)
         if job.full:
             for record in records:
-                cid=record['message']['chat_id'];job.chat_counts[cid]=job.chat_counts.get(cid,0)+1
+                cid=record['message']['chat_id'];counts[cid]=counts.get(cid,0)+1
+        progress=(max((r[0] for r in rows),default=0),job.rows+len(rows),counts) if job.full else None
+        result=store.write_batch(self.c,desc,records,cursor,desc['entry']['revision'],verify_existing=job.full,scan_progress=progress)
+        job.chat_counts=counts
+        if self.notifications and result['added_ids'] and not job.full and not job.tail and job.event_at is not None:
+            from .realtime_bridge import notify
+            notify(self.adapter.platform,result['added_ids'],time.time()-(time.monotonic()-job.event_at))
         for counter,digest in seen:
             memo[counter]=digest;memo.move_to_end(counter)
         while len(memo)>2000:memo.popitem(last=False)
@@ -121,13 +159,13 @@ class Engine:
             self.c.commit()
     def status(self):
         values=sorted(self.latencies);n=len(values)
-        return dict(**self.results,fast_sources=len(self.fast),full_sources=len(self.full),unresolved_sources=self.unresolved,
+        return dict(**self.results,fast_sources=len(self.fast),full_sources=len(self.full),tail_sources=len(self.tail),background_budget=self.background_budget,unresolved_sources=self.unresolved,
             last_success=self.last_success,last_full_success=self.last_full_success,latency_samples=n,
             latency_p95_seconds=values[min(n-1,int(n*.95))] if n>=20 else None,
             latency_validation='measured' if n>=20 else 'insufficient_samples',
             last_latency_seconds=self.latencies[-1] if n else None)
     def collect(self):
-        retained=[job.desc['entry']['folder'] for job in list(self.fast.values())+list(self.full.values())]
+        retained=[job.desc['entry']['folder'] for job in list(self.fast.values())+list(self.full.values())+list(self.tail.values())]
         self.adapter.snapshots.collect(retained)
     def close(self):
-        for job in list(self.fast.values())+list(self.full.values()):job.close()
+        for job in list(self.fast.values())+list(self.full.values())+list(self.tail.values()):job.close()

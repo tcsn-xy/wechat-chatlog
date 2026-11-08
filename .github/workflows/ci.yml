@@ -29,6 +29,8 @@ jobs:
       WX_MYSQL_PASSWORD: synthetic-ci-only
       WX_MYSQL_HOST: 127.0.0.1
       WX_MYSQL_PORT: 3306
+      RAYON_NUM_THREADS: 2
+      OPENBLAS_NUM_THREADS: 1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,7 +38,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install -r requirements.txt -r requirements-mcp.txt
+      - run: python -m pip install -r requirements.txt -r requirements-mcp.txt -r requirements-semantic.txt
       - run: python -B -m compileall -q lib scripts tests
       - run: python -B -m unittest discover -s tests -v
       - run: python -B scripts/wecom_selftest.py

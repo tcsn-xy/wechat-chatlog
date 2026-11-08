@@ -361,9 +361,12 @@ class Reader:
                                       'WHERE platform=%s AND account_key=%s AND image_sha256=%s ORDER BY id DESC',
                                       [platform, account, sha]) if sha else []
             row['caption_status'] = row['captions'][0]['status'] if row['captions'] else 'not_available'
-            row['viewable'] = bool(row['msg_kind'] in IMAGE_KINDS and row['storage'] == 'file'
+            row['viewable'] = bool(row['msg_kind'] in IMAGE_KINDS
                                    and (row.get('decoded_path_status') == 'exists_not_verified'
-                                        or row.get('file_path_status') == 'exists_not_verified'))
+                                        or row.get('file_path_status') == 'exists_not_verified'
+                                        or row.get('stored_blob')))
+            from .attachments import hints
+            row['download'] = hints(row)
             if row['msg_kind'] == 'voice':
                 stub = dict(id=message_pk or 0, platform=platform, account_key=account)
                 row['voice_transcripts'] = self.transcripts(c, stub, row['id'])
@@ -440,7 +443,7 @@ class Reader:
                                       reason=f'一次最多返回 {MAX_PREVIEW_IMAGES} 张图片预览；可用 media_ref 单张查看')
                 continue
             source = self._preview_source(row)
-            if source is None:
+            if source is None and not (row['msg_kind'] in IMAGE_KINDS and row.get('stored_blob')):
                 error = dict(code='image_unavailable',
                              message='本机没有可读取的图片缓存文件；caption 不代表图片内容已补齐')
                 row['preview'] = dict(available=False, error=error)
@@ -449,7 +452,17 @@ class Reader:
                 continue
             try:
                 from .preview import render_preview
-                preview = render_preview(source, max_edge=max_edge)
+                if source is not None:
+                    preview = render_preview(source, max_edge=max_edge)
+                else:
+                    from .attachments import _chunks
+                    from .preview import MAX_SOURCE_BYTES, render_preview_bytes
+                    payload = bytearray()
+                    for block in _chunks(self.connections[platform], row):
+                        if len(payload) + len(block) > MAX_SOURCE_BYTES:
+                            raise QueryError('media_too_large', '图片超过预览字节上限')
+                        payload.extend(block)
+                    preview = render_preview_bytes(bytes(payload), max_edge=max_edge)
             except QueryError as exc:
                 row['preview'] = dict(available=False, error=exc.detail)
                 failures.append(exc.detail)

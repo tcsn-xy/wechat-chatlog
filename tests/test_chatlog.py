@@ -37,10 +37,26 @@ class UnitTests(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 self.assertEqual(main(['capabilities', '--json']), 0)
             result = json.loads(out.getvalue())
-            self.assertTrue(result['data']['read_only'])
-            self.assertEqual(result['data']['version'], '1.1.0')
-            self.assertEqual(set(result['data']['commands']), {'status','chats','contacts','members','messages','search','context','message','media','capabilities'})
+            self.assertFalse(result['data']['read_only'])
+            self.assertTrue(result['data']['database_read_only'])
+            self.assertEqual(result['data']['version'], '1.3.0')
+            self.assertEqual(set(result['data']['commands']), {'status','chats','contacts','members','messages','search','semantic_search','context','message','media','attachments','download','send','send_status','capabilities'})
             self.assertIn('out', {item['name'] for item in result['data']['commands']['media']['parameters']})
+            guide = result['data']['feature_guide']
+            self.assertTrue(any(item['tools'] == ['attachments', 'download'] for item in guide))
+            for item in guide:
+                self.assertTrue(set(item['tools']) <= set(result['data']['commands']))
+
+    def test_plain_capabilities_explains_features_without_config(self):
+        with patch('chatlog_core.cli.load_config', side_effect=AssertionError('must not connect')):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(['capabilities']), 0)
+        text = out.getvalue()
+        self.assertIn('attachments → download', text)
+        self.assertIn('output_path', text)
+        self.assertIn('未缓存内容不能', text)
+        self.assertNotIn('"parameters"', text)
 
     def test_media_consent_requires_private_optin(self):
         with tempfile.TemporaryDirectory() as directory:

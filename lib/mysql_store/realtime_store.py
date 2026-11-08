@@ -29,6 +29,9 @@ def prepare(c):
         bootstrap BOOL NOT NULL DEFAULT 1,last_revision BIGINT NOT NULL DEFAULT 0,
         checked_rows BIGINT NOT NULL DEFAULT 0,last_full_at DATETIME,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+    columns={r['Field'] for r in my.query(c,'SHOW COLUMNS FROM rt_sources')}
+    for name,typ in [('scan_active','BOOL NOT NULL DEFAULT 0'),('scan_cursor','BIGINT NOT NULL DEFAULT 0'),('scan_rows','BIGINT NOT NULL DEFAULT 0'),('scan_counts','JSON')]:
+        if name not in columns:my.execute(c,'ALTER TABLE rt_sources ADD COLUMN '+name+' '+typ)
     c.commit()
 
 
@@ -98,9 +101,9 @@ def checkpoint(c,source,cursor,rev,*,complete=False,checked_rows=0):
         (key,source['platform'],source['account_key'],source['dataset'],source['source_db'],source['source_table'],cursor,source['schema_hash'],source['file_identity'],int(not complete),rev,checked_rows,complete,complete,complete,complete))
 
 
-def write_batch(c,source,records,cursor,rev,*,complete=False,checked_rows=0,failpoint=None,verify_existing=False):
+def write_batch(c,source,records,cursor,rev,*,complete=False,checked_rows=0,failpoint=None,verify_existing=False,scan_progress=None):
     if len(records)>500:raise ValueError('batch exceeds 500')
-    result=dict(added=0,updated=0,unchanged=0,stale=0,added_counters=[])
+    result=dict(added=0,updated=0,unchanged=0,stale=0,added_counters=[],added_ids=[])
     with writer_lock(c):
         c.begin()
         try:
@@ -122,7 +125,7 @@ def write_batch(c,source,records,cursor,rev,*,complete=False,checked_rows=0,fail
                 previous={r['id']:r for r in my.query(c,'SELECT m.*,r.message_pk raw_pk,r.raw_content,r.raw_blob,r.extra_blob,r.compress_type,r.raw_bytes,r.decoded_from FROM messages m LEFT JOIN message_raw r ON r.message_pk=m.id WHERE m.id IN ('+placeholders+')',tuple(unknown))}
                 for link in my.query(c,'SELECT message_pk,url,title,des,app_type,origin FROM message_links WHERE message_pk IN ('+placeholders+')',tuple(unknown)):
                     previous_links.setdefault(link['message_pk'],[]).append(tuple(link[k] for k in ('url','title','des','app_type','origin')))
-            affected=set();profiles={}
+            affected=set();profiles={};unchanged_updates=[]
             for record in records:
                 m=record['message'];profiles[(m['chat_pk'],m.get('sender_id') or '系统')]=record.get('member_profile',{})
                 old=existing.get((m['chat_id'],int(m['local_id'])))
@@ -133,13 +136,13 @@ def write_batch(c,source,records,cursor,rev,*,complete=False,checked_rows=0,fail
                     prior=previous[old['id']]
                     old['rt_hash']=fingerprint(dict(message={k:prior.get(k) for k in m},raw={k:prior.get(k) for k in record['raw']},links=previous_links.get(old['id'],[])))
                 if old and old['rt_hash']==digest:
-                    my.execute(c,'UPDATE messages SET rt_hash=%s,rt_revision=GREATEST(rt_revision,%s) WHERE id=%s',(digest,rev,old['id']))
+                    unchanged_updates.append((old['id'],digest))
                     result['unchanged']+=1;continue
                 row=dict(m,rt_hash=digest,rt_revision=rev)
                 if old:
                     my.execute(c,'UPDATE messages SET '+','.join('`%s`=%%s'%k for k in row)+' WHERE id=%s',(*row.values(),old['id']));pk=old['id'];result['updated']+=1
                 else:
-                    cur=my.execute(c,'INSERT INTO messages ('+','.join('`%s`'%k for k in row)+') VALUES ('+','.join(['%s']*len(row))+')',tuple(row.values()));pk=cur.lastrowid;result['added']+=1;result['added_counters'].append(record.get('_source_counter',int(m['local_id'])))
+                    cur=my.execute(c,'INSERT INTO messages ('+','.join('`%s`'%k for k in row)+') VALUES ('+','.join(['%s']*len(row))+')',tuple(row.values()));pk=cur.lastrowid;result['added']+=1;result['added_counters'].append(record.get('_source_counter',int(m['local_id'])));result['added_ids'].append(pk)
                 raw=dict(message_pk=pk,platform=m['platform'],**record['raw'])
                 my.execute(c,'INSERT INTO message_raw ('+','.join('`%s`'%k for k in raw)+') VALUES ('+','.join(['%s']*len(raw))+') ON DUPLICATE KEY UPDATE '+','.join('`%s`=VALUES(`%s`)'%(k,k) for k in raw if k!='message_pk'),tuple(raw.values()))
                 my.execute(c,'DELETE FROM message_links WHERE message_pk=%s',(pk,))
@@ -149,6 +152,11 @@ def write_batch(c,source,records,cursor,rev,*,complete=False,checked_rows=0,fail
                 if not old or old['sender_id']!=m.get('sender_id') or old['ts']!=m['ts']:
                     affected.add((m['chat_pk'],m['platform'],m['account_key'],m['chat_id'],m.get('sender_id') or '系统'))
                 if old and old['sender_id'] and old['sender_id']!=m.get('sender_id'):affected.add((m['chat_pk'],m['platform'],m['account_key'],m['chat_id'],old['sender_id']))
+            if unchanged_updates:
+                cases=' '.join('WHEN %s THEN %s' for _ in unchanged_updates)
+                ids=tuple(pk for pk,_ in unchanged_updates)
+                params=(rev,)+tuple(v for item in unchanged_updates for v in item)+ids
+                my.execute(c,'UPDATE messages SET rt_revision=GREATEST(rt_revision,%s),rt_hash=CASE id '+cases+' ELSE rt_hash END WHERE id IN ('+','.join(['%s']*len(ids))+')',params)
             # Derive totals from retained messages, never overwrite them with batch sizes.
             for pk in {v[0] for v in affected}:
                 my.execute(c,'UPDATE chats SET message_count=(SELECT COUNT(*) FROM messages WHERE chat_pk=%s),first_ts=(SELECT MIN(ts) FROM messages WHERE chat_pk=%s),last_ts=(SELECT MAX(ts) FROM messages WHERE chat_pk=%s) WHERE chat_pk=%s',(pk,pk,pk,pk))
@@ -157,6 +165,11 @@ def write_batch(c,source,records,cursor,rev,*,complete=False,checked_rows=0,fail
                 prof=profiles.get((pk,sender),{})
                 my.execute(c,'INSERT INTO chat_members(platform,chat_pk,chat_id,contact_id,shown,message_count,first_ts,last_ts,room_nick,nick_name,remark,alias) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE shown=VALUES(shown),message_count=VALUES(message_count),first_ts=VALUES(first_ts),last_ts=VALUES(last_ts),room_nick=COALESCE(VALUES(room_nick),room_nick),nick_name=COALESCE(VALUES(nick_name),nick_name),remark=COALESCE(VALUES(remark),remark),alias=COALESCE(VALUES(alias),alias)',(platform,pk,cid,sender,stats['shown'],stats['n'],stats['lo'],stats['hi'],(prof.get('room_nick') or '')[:255] or None,(prof.get('nick') or '')[:255] or None,(prof.get('remark') or '')[:255] or None,(prof.get('alias') or '')[:191] or None))
             checkpoint(c,source,cursor,rev,complete=complete,checked_rows=checked_rows)
+            if complete:
+                my.execute(c,'UPDATE rt_sources SET scan_active=0,scan_cursor=0,scan_rows=0,scan_counts=NULL WHERE source_key=%s',(source_key(source),))
+            elif scan_progress is not None:
+                sc,rows,counts=scan_progress
+                my.execute(c,'UPDATE rt_sources SET scan_active=1,scan_cursor=%s,scan_rows=%s,scan_counts=%s WHERE source_key=%s',(sc,rows,json.dumps(counts,ensure_ascii=False),source_key(source)))
             if failpoint:failpoint()
             c.commit();return result
         except BaseException:c.rollback();raise

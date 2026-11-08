@@ -101,14 +101,17 @@ class Wechat:
                     latest=sc.execute('SELECT create_time FROM '+quoted(table)+' WHERE local_id=?',(hi,)).fetchone()
                     desc=dict(priority_ts=int(latest[0] or 0) if latest else 0,platform='wechat',account_key=self.account,dataset='wechat-snapshot',source_db=original.name,source_table=table,
                         schema_hash=hashlib.sha256((sql or '').encode()).hexdigest(),file_identity=str(entry['signature'][0][1]),original=original,
-                        entry=entry,counter='local_id',max_id=int(hi),chat_id=cid,senders=senders,has_ct='WCDB_CT_message_content' in cols)
+                        entry=entry,counter='local_id',max_id=int(hi),chat_id=cid,senders=senders,has_ct='WCDB_CT_message_content' in cols,
+                        has_source='source' in cols,has_source_ct='WCDB_CT_source' in cols)
                     out.append(desc)
             finally:sc.close()
         return out,unresolved
-    def rows(self,desc,after=None,tail=False,ids=None,batch_size=500):
+    def rows(self,desc,after=None,tail=False,ids=None,batch_size=500,tail_limit=2000):
         cols='local_id,local_type,real_sender_id,create_time,message_content,server_id,sort_seq'
         if desc['has_ct']:cols+=',WCDB_CT_message_content'
-        boundary=after;remaining=2000 if tail else None
+        cols+=',source' if desc.get('has_source') else ',NULL'
+        cols+=',WCDB_CT_source' if desc.get('has_source_ct') else ',NULL'
+        boundary=after;remaining=tail_limit if tail else None
         while remaining is None or remaining>0:
             query='SELECT '+cols+' FROM '+quoted(desc['source_table']);where=[];args=[]
             if ids is not None:where.append('local_id IN ('+','.join(['?']*len(ids))+')');args.extend(ids)
@@ -127,7 +130,7 @@ class Wechat:
         main,raw,links,refs,sender,kind,ts,lid=wx_import.decode_message(self.helper,row,desc['has_ct'],cid,0,desc['source_db'],desc['source_table'],desc['senders'])
         chat=self.directory.describe(cid,self.account)
         if cid.startswith('ORPHAN_'):chat.update(is_orphan=True)
-        return dict(message=dict(zip(store.WX_COLUMNS,main)),raw=dict(zip(['raw_content','compress_type','raw_bytes','decoded_from','raw_blob'],raw)),links=links,chat=chat,member_profile=self.directory.profile(sender,cid))
+        return dict(message=dict(zip(store.WX_COLUMNS,main)),raw=dict(zip(['raw_content','compress_type','raw_bytes','decoded_from','raw_blob','extra_blob'],raw)),links=links,chat=chat,member_profile=self.directory.profile(sender,cid))
 
 
 class Wecom:
@@ -207,8 +210,8 @@ class Wecom:
                         entry=entry,counter='rowid',max_id=int(hi),mapped=mapped))
             finally:sc.close()
         return out,0
-    def rows(self,desc,after=None,tail=False,ids=None,batch_size=500):
-        wanted=[(k,v) for k,v in desc['mapped'].items() if v];boundary=after;remaining=2000 if tail else None
+    def rows(self,desc,after=None,tail=False,ids=None,batch_size=500,tail_limit=2000):
+        wanted=[(k,v) for k,v in desc['mapped'].items() if v];boundary=after;remaining=tail_limit if tail else None
         while remaining is None or remaining>0:
             query='SELECT rowid,'+','.join(quoted(v) for k,v in wanted)+' FROM '+quoted(desc['source_table']);where=[];args=[]
             if ids is not None:where.append('rowid IN ('+','.join(['?']*len(ids))+')');args.extend(ids)

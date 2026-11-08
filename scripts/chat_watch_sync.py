@@ -14,6 +14,7 @@ import sys
 import threading
 import traceback
 import time
+from zoneinfo import ZoneInfo
 ROOT=Path(__file__).resolve().parents[1];sys.path[:0]=[str(ROOT/'lib'),str(ROOT/'scripts')]
 from localio import atomic_json,task_lock
 from mysql_store import conn as my,realtime_store as store,realtime_bridge as bridge
@@ -22,6 +23,7 @@ from mysql_store.realtime_snapshot import Changes,Debounce,SnapshotChanged
 from mysql_store.realtime_engine import Engine
 from wxexport import config as wxconfig
 from wecom import config as wcconfig,keys as wckeys,extract
+from runtime_performance import settings as performance_settings
 LABEL='local.wxexport.realtime-sync'
 PLIST=Path.home()/'Library/LaunchAgents'/(LABEL+'.plist')
 STATE=bridge.STATE
@@ -47,8 +49,13 @@ class Runner:
         self.state=dict(enabled=not observe,ready=False,mode='starting',pid=os.getpid(),started_at=dt.datetime.now().isoformat())
         self.adapter=None;self.engine=None;self.c=None;self.watch=Changes();self.paths=[];self.last_publish=0
         self.seen={};self.dirty=set();self.event_at=None;self.debounce=Debounce()
-        self.last_poll=0;self.last_discovery=0;self.last_probe=0;self.next_full=time.monotonic()+3600
-        self.force_full=True;self.request_token=None;self.failures=0;self.first_capture=True
+        self.performance=performance_settings()
+        self.scheduler_path=STATE/(platform+'.scheduler.json')
+        try:self.scheduler=json.loads(self.scheduler_path.read_text())
+        except (OSError,ValueError):self.scheduler={}
+        self.last_poll=0;self.last_discovery=0;self.last_probe=0;self.next_tail=time.monotonic()+self.performance['tail_interval_seconds']
+        self.force_full=False;self.request_token=self.scheduler.get('last_request_token');self.failures=0;self.first_capture=True
+        self.debounce=Debounce(quiet=self.performance['debounce_seconds'],maximum=self.performance['max_debounce_seconds'])
         self.last_wall=time.time();self.last_mono=time.monotonic()
     def publish(self,**fields):
         with self.lock:
@@ -81,20 +88,21 @@ class Runner:
         if self.c is not None:self.c.ping(reconnect=False);return
         self.c=my.connect(self.database)
         with store.writer_lock(self.c):store.prepare(self.c)
-        self.engine=Engine(self.c,self.adapter)
+        self.engine=Engine(self.c,self.adapter,background_budget=1.0 if self.once else self.performance['background_cpu_budget']/2,tail_rows=int(self.performance['tail_rows']),notifications=self.database in ('wx_chat','wecom_chat'))
     def requests(self):
         path=STATE/(self.platform+'.request.json')
         if path.exists():
             request=json.loads(path.read_text())
             if request['token']!=self.request_token:
                 self.request_token=request['token'];self.force_full=True
-        if time.monotonic()>=self.next_full:self.force_full=True
+        now=dt.datetime.now(ZoneInfo('Asia/Shanghai'))
+        if now.hour>=self.performance['full_scan_hour'] and self.scheduler.get('last_daily_date')!=now.date().isoformat():self.force_full=True
     def iteration(self,woken=False):
         if self.adapter is None:
             self.adapter=adapter_for(self.platform);self.cleanup_abandoned()
         now=time.monotonic();wall=time.time()
         if wall-self.last_wall-(now-self.last_mono)>5 or wall-self.last_wall>300:
-            self.force_full=True;self.first_capture=True;self.last_discovery=0
+            self.first_capture=True;self.last_discovery=0
             self.publish(resumed_at=dt.datetime.now().isoformat())
         self.last_wall=wall;self.last_mono=now
         if not self.paths or now-self.last_discovery>=30 or (woken and now-self.last_discovery>=2):self.discover()
@@ -104,7 +112,7 @@ class Runner:
                 paths=self.adapter.discover();self.adapter.signatures(paths)
                 self.adapter.mode='direct';self.adapter.snapshots.remote_copy=None;self.paths=paths
             except (OSError,RuntimeError):pass
-        if now-self.last_poll>=2 or woken:
+        if now-self.last_poll>=self.performance['poll_seconds'] or woken:
             latest=self.signatures();changed={p for p,v in latest.items() if self.seen.get(p)!=v}
             removed=set(self.seen)-set(latest)
             if changed or removed:
@@ -132,16 +140,19 @@ class Runner:
                 metadata_changed=any(p.name in ('session.db','contact.db','user.db') for p in captured)
                 schedule=self.paths if self.force_full or (metadata_changed and self.engine.unresolved) else captured
                 self.engine.schedule(schedule,event_at=None if self.first_capture else self.event_at,force_full=self.force_full)
-                if self.force_full:self.next_full=time.monotonic()+3600
+                if self.force_full:self.scheduler['last_daily_date']=dt.datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+                self.scheduler['last_request_token']=self.request_token;atomic_json(self.scheduler_path,self.scheduler)
             self.first_capture=False;self.force_full=False;self.dirty.clear();self.event_at=None;self.debounce.clear()
             self.publish(mode=self.adapter.mode,ready=not self.observe,observed=True,validated_files=len(captured),snapshot_at=dt.datetime.now().isoformat(),error=None)
             if self.observe:
                 self.adapter.snapshots.collect()
                 if self.once:return False
         if self.engine:
+            if now>=self.next_tail:
+                self.engine.request_tail();self.next_tail=now+self.performance['tail_interval_seconds']
             self.engine.step();self.engine.collect()
             self.publish(mode=self.adapter.mode,ready=True,error=None,writer_busy=False,**self.engine.status())
-            if self.once and not self.engine.fast and not self.engine.full:return False
+            if self.once and not self.engine.fast and not self.engine.full and not self.engine.tail:return False
         return True
     def run(self):
         wake=False
@@ -150,8 +161,9 @@ class Runner:
                 try:
                     if not self.iteration(wake):break
                     self.failures=0
-                    busy=bool(self.engine and (self.engine.fast or self.engine.full))
-                    wake=self.watch.wait(0 if busy else 0.5)
+                    fast=bool(self.engine and self.engine.fast)
+                    delay=0 if fast else .2 if self.engine and (self.engine.full or self.engine.tail) else .5
+                    wake=self.watch.wait(delay)
                 except BlockingIOError:
                     self.publish(writer_busy=True,error='writer_busy');self.stop.wait(1)
                 except SnapshotChanged:

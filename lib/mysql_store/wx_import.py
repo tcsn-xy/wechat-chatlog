@@ -59,14 +59,16 @@ def _safe_text(s, limit: int = 0) -> str:
 
 
 def decode_message(self, row, has_ct, cid, pk, db_name, tbl, senders):
-    if has_ct: lid,lt,rsid,ts,raw,svr,seq,ct=row
-    else: lid,lt,rsid,ts,raw,svr,seq=row;ct=None
+    base=8 if has_ct else 7
+    if has_ct: lid,lt,rsid,ts,raw,svr,seq,ct=row[:base]
+    else: lid,lt,rsid,ts,raw,svr,seq=row[:base];ct=None
     ts=int(ts or 0);lid=int(lid)
     original=parse.decode_content(raw,ct)
     sender,payload=parse.split_sender(original)
     sender=sender or senders.get(int(rsid or 0)) or "系统"
-    if sender==cid or sender.endswith("@chatroom"):sender="系统"
+    if (cid.endswith('@chatroom') and sender==cid) or sender.endswith("@chatroom"):sender="系统"
     kind,text,refs=parse.describe(int(lt)&parse.TYPE_MASK,payload)
+    if kind=='system':sender='系统'
     refs=wx_refs.enrich_refs(kind,payload,refs)
     links=self._extract_links(payload,text)
     disp="我" if sender==self.self_wxid else self.dir.display(sender,cid)
@@ -76,7 +78,13 @@ def decode_message(self, row, has_ct, cid, pk, db_name, tbl, senders):
           _safe_text(text) or None,str(int(lt)&parse.TYPE_MASK),"wechat-snapshot",db_name,tbl,
           int(bool(refs) or kind in MEDIA_KINDS),int(bool(links)))
     blob=bytes(raw) if isinstance(raw,(bytes,bytearray)) else (str(raw).encode() if raw is not None else None)
-    return main,(original,ct,len(blob or b""),"zstd" if ct==4 else "plain",blob),links,refs,sender,kind,ts,lid
+    # Keep actual @ metadata separate from the user-controlled body. Older
+    # snapshots without the source column remain readable with unknown mentions.
+    source=None
+    if len(row)>base and row[base] is not None:
+        decoded=parse.decode_content(row[base],row[base+1] if len(row)>base+1 else None)
+        source=json.dumps({'wechat_source':decoded},ensure_ascii=False).encode('utf-8')
+    return main,(original,ct,len(blob or b""),"zstd" if ct==4 else "plain",blob,source),links,refs,sender,kind,ts,lid
 
 class WxImporter:
     def __init__(self, paths: config.Paths, *, limit: int = 0, chat: str = "",
@@ -331,6 +339,9 @@ class WxImporter:
             has_ct = False
         if has_ct:
             cols += ", WCDB_CT_message_content"
+        table_cols={r[1] for r in c.execute('PRAGMA table_info('+tbl+')')}
+        cols += ',source' if 'source' in table_cols else ',NULL'
+        cols += ',WCDB_CT_source' if 'WCDB_CT_source' in table_cols else ',NULL'
         try:
             rows = c.execute("SELECT %s FROM %s ORDER BY create_time, local_id"
                              % (cols, tbl))
@@ -355,9 +366,9 @@ class WxImporter:
         )
         raw_sql = (
                         "INSERT INTO `message_raw` (`message_pk`,`platform`,"
-                        "`raw_content`,`compress_type`,`raw_bytes`,`decoded_from`,`raw_blob`) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE "
-                        "`raw_content`=VALUES(`raw_content`),`raw_blob`=VALUES(`raw_blob`),"
+                        "`raw_content`,`compress_type`,`raw_bytes`,`decoded_from`,`raw_blob`,`extra_blob`) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE "
+                        "`raw_content`=VALUES(`raw_content`),`raw_blob`=VALUES(`raw_blob`),`extra_blob`=VALUES(`extra_blob`),"
                         "`compress_type`=VALUES(`compress_type`),`raw_bytes`=VALUES(`raw_bytes`),`decoded_from`=VALUES(`decoded_from`)"
         )
         link_sql = (

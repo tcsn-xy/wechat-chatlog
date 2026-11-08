@@ -102,6 +102,40 @@ class Integration(unittest.TestCase):
         my.execute(self.c,'DELETE FROM message_raw LIMIT 1');self.c.commit()
         self.capture(full=True);self.drain()
         self.assertEqual(my.scalar(self.c,'SELECT COUNT(*) FROM messages'),my.scalar(self.c,'SELECT COUNT(*) FROM message_raw'))
+    def test_unchanged_sources_do_not_reschedule_all_tails(self):
+        self.capture(full=True);self.drain();self.capture()
+        self.assertFalse(self.engine.fast);self.assertFalse(self.engine.full)
+        self.engine.request_tail();self.assertTrue(self.engine.tail);self.drain()
+
+    def test_bounded_tail_detects_edit_without_advancing_append_cursor(self):
+        self.capture(full=True);self.drain()
+        path=Path(self.paths.db_storage)/'message/message_0.db'
+        c=sqlcipher3.connect(str(path));c.execute("PRAGMA key='fixture-only'");c.execute('UPDATE '+self.tables[0]+" SET message_content='changed tail text' WHERE local_id=1");c.commit();c.close()
+        self.capture();self.assertFalse(self.engine.fast)
+        self.engine.request_tail();before={k:v['cursor_id'] for k,v in self.engine.cursors.items()};self.drain()
+        self.assertEqual(before,{k:v['cursor_id'] for k,v in self.engine.cursors.items()})
+        self.assertEqual(my.scalar(self.c,"SELECT COUNT(*) FROM messages WHERE text='changed tail text'"),1)
+
+    def test_full_reconciliation_resumes_durable_progress(self):
+        for i in range(10,230):self.insert(i,text='resume fixture')
+        self.capture(full=True)
+        key=next(k for k,d in self.engine.descriptors.items() if d['source_db']=='message_0.db')
+        for _ in range(30):
+            self.engine.step();saved=my.query(self.c,'SELECT * FROM rt_sources WHERE source_key=%s',(key,))
+            if saved and saved[0]['scan_rows']>0:break
+        saved=saved[0];self.assertTrue(saved['scan_active']);self.assertGreater(saved['scan_rows'],0)
+        self.engine.close();self.engine=Engine(self.c,self.a);self.capture()
+        self.assertEqual(self.engine.full[key].rows,saved['scan_rows'])
+        self.drain();state=my.query(self.c,'SELECT * FROM rt_sources WHERE source_key=%s',(key,))[0]
+        self.assertFalse(state['scan_active']);self.assertEqual(state['scan_cursor'],0)
+        self.assertEqual(my.scalar(self.c,"SELECT COUNT(*) FROM messages WHERE text='resume fixture'"),220)
+
+    def test_background_budget_never_blocks_new_append(self):
+        self.capture(full=True);self.drain();self.engine.background_budget=.05;self.engine.next_background=time.monotonic()+60
+        self.engine.request_full();self.assertFalse(self.engine.step());self.assertTrue(self.engine.full)
+        self.insert(100,text='priority new');self.capture()
+        self.assertTrue(self.engine.step())
+        self.assertEqual(my.scalar(self.c,"SELECT COUNT(*) FROM messages WHERE text='priority new'"),1)
     def test_unresolved_new_group_waits_for_mapping(self):
         self.capture();self.drain();before=my.scalar(self.c,'SELECT COUNT(*) FROM messages')
         cid='300@chatroom';table='Msg_'+hashlib.md5(cid.encode()).hexdigest()

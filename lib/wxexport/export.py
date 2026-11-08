@@ -253,11 +253,13 @@ class Exporter:
                     sender = senders[rsid]
                 # 群自身的系统消息会拿"会话 ID"当前缀（例如「XXX邀请你加入了群聊」），
                 # 那不是一个人，归到系统消息里
-                if sender and (sender == chat["chat_id"]
+                if sender and ((chat["chat_id"].endswith('@chatroom') and sender == chat["chat_id"])
                                or sender.endswith("@chatroom")):
                     sender = None
                 sender = sender or "系统"
                 kind, text, media_refs = parse.describe(real, payload)
+                if kind == 'system':
+                    sender = '系统'
                 media_refs=enrich_refs(kind,payload,media_refs)
 
                 disp = self.self_name if sender == self.self_wxid else \
@@ -434,7 +436,7 @@ class Exporter:
             for r in records:
                 s = r["sender"] or ""
                 # 群自己的系统消息会带会话 ID 前缀，别把它当成一个"人"
-                if not s or s == "系统" or s == chat_id or s.endswith("@chatroom"):
+                if not s or s == "系统" or (chat_id.endswith('@chatroom') and s == chat_id) or s.endswith("@chatroom"):
                     continue
                 spoke[s] = spoke.get(s, 0) + 1
             unattributed = len(records) - sum(spoke.values())

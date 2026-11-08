@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>chatlog · Codex 桥接</title><link rel="stylesheet" href="/bridge_ui.css"><script defer src="/bridge_ui.js"></script></head>
+<body><main>
+<header><div class="eyebrow">CHATLOG / LOCAL</div><h1>让消息找到对的工作会话</h1><p>你选择谁能调用、在哪个工作空间、进入哪个桌面 Codex 会话。</p></header>
+<div id="notice" role="status"></div>
+<section class="toolbar"><strong id="connection">正在连接本机服务…</strong><button id="pause">暂停全部调用</button><button id="reload">重新读取配置</button><button id="save" class="primary">保存配置</button></section>
+<section><div class="heading"><h2>联系人与工作会话</h2><button id="owner">添加本人绑定</button></div><p class="hint">同一个人的微信、企微和所有群聊，共用你为此人选择的会话。Codex 沿用该会话现有能力和权限。</p><div id="people"></div><p id="empty" hidden>还没有联系人。在下方搜索并添加。</p></section>
+<section><h2>添加平台身份</h2><form id="search"><label>姓名或精确联系人 ID<input id="query" placeholder="搜索微信 / 企微联系人" maxlength="100" required></label><label>添加到<select id="target"></select></label><button type="submit">搜索</button></form><div id="results"></div><p class="hint">同名不自动关联。合并两个平台身份后，请核对 ID 并勾选“确认这些身份属于同一人”。</p></section>
+<section><h2>最近投递</h2><p class="hint">这里只展示桥接记录。问题排队、思考和执行由桌面 Codex 管理；没有回答时不发信。</p><div class="table-wrap"><table><thead><tr><th>时间</th><th>联系人</th><th>来源</th><th>状态</th></tr></thead><tbody id="deliveries"></tbody></table></div></section>
+<footer>私聊：豆包豆包＋问题 · 群聊：真实 @本人＋豆包豆包＋问题 · 本人：直接使用口令<br>每次追问需重新触发。回复发回原聊天，不转发思考过程或执行日志。</footer>
+</main></body></html>

@@ -1,0 +1,2 @@
+# Optional, embedded on-disk vector search. Ordinary chatlog commands do not import it.
+lancedb==0.41.0
